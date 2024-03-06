@@ -1,8 +1,12 @@
+import os
+from typing import List
+
 import matplotlib.pyplot as plt
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import List
 
 
 class BigramsProb:
@@ -293,7 +297,7 @@ class TrigramsWeights:
         for _ in range(num_it):
             new_name = ""
             idx1 = 0
-            idx2 = torch.randint(1, 27, size=(1, ), generator=self.generator).item()
+            idx2 = 0
             
             while True:
                 xenc1 = F.one_hot(torch.tensor([idx1]), num_classes=27).float()
@@ -327,9 +331,180 @@ class TrigramsWeights:
             
         return test_loss.item()
             
+            
+class MLP(nn.Module):
+    def __init__(self, vocab_size: int, emb_size: int):
+        super(MLP, self).__init__()
+        self.embeddings = nn.Embedding(num_embeddings=vocab_size, embedding_dim=emb_size)
+        self.fc1 = nn.Linear(in_features=30, out_features=200)
+        self.fc2 = nn.Linear(in_features=200, out_features=vocab_size)
+        
+    def forward(self, x: torch.tensor):
+        x = self.embeddings(x)
+        x = nn.Flatten()(x)
+        
+        x = nn.Tanh()(self.fc1(x))
+        x = self.fc2(x)
+        
+        return x
+    
+    
+class MLPTrainer:
+    def __init__(self, data: List[str], context_length: int = 3, emb_size: int = 10, device: str = 'cpu', seed: int = 42, model_save_path: str = "./Models/mlp.pt"):        
+        self.data = data
+        
+        self.context_length = context_length
+        
+        chars = sorted(list(set("".join(data))))
+        
+        self.vocab_size = len(chars) + 1
+        
+        self.stoi = {s:i + 1 for i, s in enumerate(chars)}
+        self.stoi['.'] = 0
+        
+        self.itos = {i: s for s, i in self.stoi.items()}
+        
+        self.model = MLP(vocab_size=self.vocab_size, emb_size=emb_size).to(device)
+
+        
+        self.generator = torch.Generator().manual_seed(seed)
+        self.initial_state = self.generator.get_state()
+                
+        self.X_train, self.Y_train = None, None
+        self.X_val, self.Y_val = None, None
+        self.X_test, self.Y_test = None, None
+        
+        self.device = device
+        
+        self.model_save_path = model_save_path
+    
+        
+    def create_dataset(self):
+        X, Y = [], []
+
+        for w in self.data:
+            context = [0] * self.context_length
+            for ch in w + '.':
+                idx = self.stoi[ch]
+                
+                X.append(context)
+                Y.append(idx)
+                
+                context = context[1:] + [idx]
+                    
+
+        X = torch.tensor(X)
+        Y = torch.tensor(Y)
+        
+        indices = torch.randperm(X.shape[0], generator=self.generator)
+                
+        thr1 = int(0.8 * X.shape[0])
+        thr2 = int(0.9 * X.shape[0])
+        
+        X_train, Y_train = X[indices[: thr1]], Y[indices[: thr1]]
+        X_val, Y_val = X[indices[thr1: thr2]], Y[indices[thr1: thr2]] 
+        X_test, Y_test = X[indices[thr2:]], Y[indices[thr2:]] 
+        
+        setattr(self, 'X_train', X_train)
+        setattr(self, 'Y_train', Y_train)
+        
+        setattr(self, 'X_val', X_val)
+        setattr(self, 'Y_val', Y_val)
+        
+        setattr(self, 'X_test', X_test)
+        setattr(self, 'Y_test', Y_test)
+                
+    
+    def train_loop(self, epochs: int = 100000, lr: float = 0.1, batch_size : int = 32):
+        if not os.path.exists(self.model_save_path):
+            raise OSError(f"The model save path {self.model_save_path} does not exist!")
+        
+        self.create_dataset()
+        
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=lr)
+        
+        self.generator.set_state(self.initial_state)
+        
+        min_val_loss = 99999999
+
+        for i in range(epochs):
+            self.model.train()
+            batch_idx = torch.randint(0, self.X_train.shape[0], (batch_size, ))
+            
+            logits = self.model(self.X_train[batch_idx].to(self.device))
+            
+            train_loss = criterion(logits, self.Y_train[batch_idx].to(self.device))
+            
+            optimizer.zero_grad()
+            train_loss.backward()
+            optimizer.step()
+            
+            self.model.eval()
+            with torch.no_grad():
+                logits = self.model(self.X_val.to(self.device))
+            
+                val_loss = criterion(logits, self.Y_val.to(self.device))
+                
+            if i == 0 or not (i + 1) % 10000:
+                print(f'Epoch #{i + 1}/{epochs} Train Loss = {train_loss.item()}; Val Loss = {val_loss.item()}')
+                
+            if val_loss.item() < min_val_loss:
+                min_val_loss = val_loss.item()
+                torch.save(self.model.state_dict(), self.model_save_path)
+                
+    
+    def generate(self, num_it: int = 5) -> List[str]:
+        names = []
+                
+        self.generator.set_state(self.initial_state)
+        
+        for _ in range(num_it):
+            new_name = ""
+            context = [0] * self.context_length
+            
+            while True:
+                x = torch.tensor([context])
+                
+                with torch.no_grad():
+                    logits = self.model(x.to(self.device))
+                probs = F.softmax(logits, dim=1).to('cpu')
+                idx = torch.multinomial(probs, num_samples=1, generator=self.generator).item()
+                
+                if idx == 0:
+                    names.append(new_name)
+                    break        
+                
+                context = context[1:] + [idx]
+                new_name += self.itos[idx]
+                
+        return names
+    
+    
+    def evaluate(self) -> float:
+        if self.Y_test is None:
+            raise ValueError("The model has not been trained yet! Call <<your_model>>.train_loop() first!")
+        
+        criterion = nn.CrossEntropyLoss()
+        
+        self.model.eval()
+        with torch.no_grad():
+            logits = self.model(self.X_test.to(self.device))
+        
+            test_loss = criterion(logits, self.Y_test.to(self.device))
+                            
+        return test_loss.item()
+    
+    
+    def load_model(self, load_model_path):
+        state_dict = torch.load(load_model_path)
+        self.model.load_state_dict(state_dict)
+        
     
 if __name__ == '__main__':
     names = open('names.txt', 'r').read().splitlines()
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
     
     # ### Bigram model from probability distribution
@@ -346,9 +521,18 @@ if __name__ == '__main__':
     # print(f"5 new names generated by the model: {model.generate()}")
     # print(f"Test Cross Entropy Loss: {model.evaluate()}")
     
-    ### Trigram model from weights learning (equivalent to a single layer of a NN)
-    model = TrigramsWeights(data=names, seed=2147483647)
+    # ### Trigram model from weights learning (equivalent to a single layer of a NN)
+    # model = TrigramsWeights(data=names, seed=2147483647)
     
-    model.train_loop(epochs=200, lr=50, alpha=0)
-    print(f"5 new names generated by the model: {model.generate()}")
-    print(f"Test Cross Entropy Loss: {model.evaluate(alpha=0)}")
+    # model.train_loop(epochs=200, lr=50, alpha=0)
+    # print(f"5 new names generated by the model: {model.generate()}")
+    # print(f"Test Cross Entropy Loss: {model.evaluate(alpha=0)}")
+    
+    ### MLP
+    trainer = MLPTrainer(data=names, device=device)
+    
+    trainer.train_loop()
+    # trainer.load_model('./Models/mlp.pt')
+    # trainer.create_dataset()
+    print(f"5 new names generated by the model: {trainer.generate()}")
+    print(f"Test Cross Entropy Loss: {trainer.evaluate()}")
